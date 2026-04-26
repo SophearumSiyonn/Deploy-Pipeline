@@ -52,7 +52,7 @@ resource "aws_security_group" "alb_sg" {
 # Security Group for EC2
 resource "aws_security_group" "MySG" {
   name        = "EC2-App-SG"
-  description = "Allow SSH and App Port"
+  description = "Allow SSH, App Port, and Node Exporter"
   vpc_id      = aws_default_vpc.default.id
 
   ingress {
@@ -67,6 +67,14 @@ resource "aws_security_group" "MySG" {
     to_port         = 5000
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg.id]
+  }
+
+  # NEW: Open Port 9100 for Node Exporter monitoring
+  ingress {
+    from_port   = 9100
+    to_port     = 9100
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] 
   }
 
   egress {
@@ -89,28 +97,28 @@ resource "aws_launch_template" "app_lt" {
     associate_public_ip_address = true
   }
 
-  # Updated for Ubuntu (apt instead of yum, ubuntu user instead of ec2-user)
+  # NEW USER DATA: Pulling from Docker Hub for a clean deployment
   user_data = base64encode(<<-EOF
-            #!/bin/bash
+              #!/bin/bash
               
-              # 1. Update and install standard packages
+              # 1. Update and install Docker ONLY
               apt-get update -y
-              apt-get install -y docker.io git
+              apt-get install -y docker.io
               
               # 2. Ensure Docker is running
               systemctl start docker
               systemctl enable docker
-              
-              # 3. Add user to docker group
               usermod -aG docker ubuntu
               
-              # 4. Clone the repository
-              git clone https://github.com/Chanveasna-ENG/Deploy-Pipeline.git /home/ubuntu/app
-              cd /home/ubuntu/app
+              # 3. Pull and Run the application image from Docker Hub (The "DockerHub way")
+              docker pull sophearumsiyonn/deploy-pipeline:v1.0
+              docker run --name deploy-app -d -p 5000:5000 sophearumsiyonn/deploy-pipeline:v1.0
               
-              # 5. Build and run the docker image
-              docker build -t evilsna/deploy-pipeline:v1.0 .
-              docker run --name deploy-app -d -p 5000:5000 evilsna/deploy-pipeline:v1.0
+              # 4. Deploy Node Exporter as a container for Prometheus/Grafana monitoring
+              docker run -d \
+                --name node-exporter \
+                -p 9100:9100 \
+                prom/node-exporter:latest
               EOF
   )
 }
@@ -148,7 +156,8 @@ resource "aws_lb_listener" "app_listener" {
   port              = "80"
   protocol          = "HTTP"
 
-  default_action {
+
+default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.app_tg.arn
   }
@@ -160,7 +169,6 @@ resource "aws_autoscaling_group" "app_asg" {
   vpc_zone_identifier = data.aws_subnets.default.ids
   target_group_arns   = [aws_lb_target_group.app_tg.arn]
   
-  # Starts with 1 instance, scales up to 3 when CPU gets too high
   min_size         = 1
   desired_capacity = 1
   max_size         = 3
@@ -177,7 +185,7 @@ resource "aws_autoscaling_group" "app_asg" {
   }
 }
 
-# Auto Scaling Policy (Triggers on 10% CPU to make it scale easily)
+# Auto Scaling Policy
 resource "aws_autoscaling_policy" "cpu_policy" {
   name                   = "cpu-scaling-policy"
   policy_type            = "TargetTrackingScaling"
@@ -187,7 +195,6 @@ resource "aws_autoscaling_policy" "cpu_policy" {
     predefined_metric_specification {
       predefined_metric_type = "ASGAverageCPUUtilization"
     }
-    # Set to 10% so that spamming refresh or opening tabs might trigger it!
     target_value = 10.0
   }
 }
